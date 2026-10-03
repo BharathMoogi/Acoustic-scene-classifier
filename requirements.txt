@@ -7,4 +7,6 @@ pandas>=2.0
 numpy>=1.24
 matplotlib>=3.7
 tqdm>=4.65
-streamlit>=1.36.0
+fastapi>=0.110.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
