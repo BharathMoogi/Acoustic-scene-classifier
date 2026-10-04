@@ -455,7 +455,7 @@ HTML_UI = """
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    return HTMLResponse(content=HTMLUI, status_code=200)
+    return HTMLResponse(content=HTML_UI, status_code=200)
 
 
 @app.get("/health")
