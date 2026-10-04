@@ -2,7 +2,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import io
 import pickle
+import traceback
 
+import soundfile as sf
 import librosa
 import numpy as np
 import pandas as pd
@@ -36,24 +38,28 @@ SCALER = None
 
 def load_model_and_assets():
     global MODEL, YAMNET, SCALER
-    if MODEL is None:
-        MODEL = tf.keras.models.load_model(str(MODEL_PATH))
-    if YAMNET is None:
-        YAMNET = hub.load("https://tfhub.dev/google/yamnet/1")
-    if SCALER is None:
-        if SCALER_PATH.exists():
-            with open(SCALER_PATH, "rb") as f:
-                SCALER = pickle.load(f)
-        elif EMBEDDINGS_PATH.exists():
-            data = np.load(EMBEDDINGS_PATH, allow_pickle=True)
-            scaler = StandardScaler()
-            scaler.fit(data["embeddings"])
-            SCALER = scaler
+    try:
+        if MODEL is None and MODEL_PATH.exists():
+            MODEL = tf.keras.models.load_model(str(MODEL_PATH))
+        if YAMNET is None:
+            YAMNET = hub.load("https://tfhub.dev/google/yamnet/1")
+        if SCALER is None:
+            if SCALER_PATH.exists():
+                with open(SCALER_PATH, "rb") as f:
+                    SCALER = pickle.load(f)
+            elif EMBEDDINGS_PATH.exists():
+                data = np.load(EMBEDDINGS_PATH, allow_pickle=True)
+                scaler = StandardScaler()
+                scaler.fit(data["embeddings"])
+                SCALER = scaler
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        traceback.print_exc()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Preload models into memory at container startup so requests don't time out
+    # Preload models at startup
     load_model_and_assets()
     yield
 
@@ -68,11 +74,24 @@ app.add_middleware(
 )
 
 
+def safe_load_audio(file_bytes: bytes, target_sr=16000) -> np.ndarray:
+    try:
+        data, sr = sf.read(io.BytesIO(file_bytes))
+    except Exception:
+        data, sr = librosa.load(io.BytesIO(file_bytes), sr=target_sr, mono=True)
+        return data.astype("float32")
+
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if sr != target_sr:
+        data = librosa.resample(data.astype("float32"), orig_sr=sr, target_sr=target_sr)
+    return data.astype("float32")
+
+
 def extract_embedding_from_bytes(file_bytes: bytes):
-    wav, _ = librosa.load(io.BytesIO(file_bytes), sr=YAMNET_SAMPLE_RATE, mono=True)
+    wav = safe_load_audio(file_bytes, target_sr=YAMNET_SAMPLE_RATE)
     if wav.size == 0:
         raise ValueError("Audio file is empty.")
-    wav = wav.astype("float32")
     _, embeddings, _ = YAMNET(wav)
     emb = embeddings.numpy().mean(axis=0)
     return emb.reshape(1, -1)
@@ -80,6 +99,9 @@ def extract_embedding_from_bytes(file_bytes: bytes):
 
 def predict_audio_bytes(file_bytes: bytes):
     load_model_and_assets()
+    if MODEL is None or YAMNET is None or SCALER is None:
+        raise RuntimeError("ML model or assets are not initialized yet.")
+
     emb = extract_embedding_from_bytes(file_bytes)
     emb_scaled = SCALER.transform(emb)
     scores = MODEL.predict(emb_scaled, verbose=0)[0]
@@ -502,4 +524,5 @@ async def predict_audio(file: UploadFile = File(...)):
         result = predict_audio_bytes(contents)
         return result
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(exc)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(exc)}")
