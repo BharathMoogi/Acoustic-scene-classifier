@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
+TFLITE_PATH = BASE_DIR / "outputs" / "yamnet_quant.tflite"
 YAMNET_DIR = BASE_DIR / "outputs" / "yamnet_model"
 WEIGHTS_PATH = BASE_DIR / "outputs" / "model_weights.pkl"
 SCALER_PATH = BASE_DIR / "outputs" / "scaler.pkl"
@@ -29,15 +30,21 @@ CLASS_NAMES = [
 ]
 YAMNET_SAMPLE_RATE = 16000
 
+INTERPRETER = None
 YAMNET = None
 WEIGHTS = None
 SCALER = None
 
 
 def load_model_and_assets():
-    global YAMNET, WEIGHTS, SCALER
+    global INTERPRETER, YAMNET, WEIGHTS, SCALER
     try:
-        if YAMNET is None:
+        if INTERPRETER is None and TFLITE_PATH.exists():
+            interp = tf.lite.Interpreter(model_path=str(TFLITE_PATH))
+            interp.allocate_tensors()
+            INTERPRETER = interp
+            print("Loaded ultra-lightweight YAMNet TFLite engine (< 4MB).")
+        elif YAMNET is None:
             if YAMNET_DIR.exists():
                 YAMNET = tf.saved_model.load(str(YAMNET_DIR))
             else:
@@ -52,7 +59,7 @@ def load_model_and_assets():
             with open(SCALER_PATH, "rb") as f:
                 SCALER = pickle.load(f)
 
-        print("All ML assets successfully loaded into memory.")
+        print("ML runtime ready.")
     except Exception as e:
         print(f"Error loading assets: {e}")
         traceback.print_exc()
@@ -60,7 +67,6 @@ def load_model_and_assets():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Preload models into RAM at startup
     load_model_and_assets()
     yield
 
@@ -75,38 +81,59 @@ app.add_middleware(
 )
 
 
-def safe_load_audio(file_bytes: bytes, target_sr=16000) -> np.ndarray:
+def safe_load_audio(file_bytes: bytes, target_sr=16000, max_seconds=15) -> np.ndarray:
     try:
         data, sr = sf.read(io.BytesIO(file_bytes))
     except Exception:
         data, sr = librosa.load(io.BytesIO(file_bytes), sr=target_sr, mono=True)
-        return data.astype("float32")
+        data = data.astype("float32")
+        return data[: target_sr * max_seconds]
 
     if data.ndim > 1:
         data = data.mean(axis=1)
     if sr != target_sr:
         data = librosa.resample(data.astype("float32"), orig_sr=sr, target_sr=target_sr)
-    return data.astype("float32")
+    
+    # Cap to max_seconds for instant responsive inference
+    data = data.astype("float32")
+    if len(data) > target_sr * max_seconds:
+        data = data[: target_sr * max_seconds]
+    return data
 
 
 def extract_embedding_from_bytes(file_bytes: bytes):
     wav = safe_load_audio(file_bytes, target_sr=YAMNET_SAMPLE_RATE)
     if wav.size == 0:
         raise ValueError("Audio file is empty.")
-    _, embeddings, _ = YAMNET(wav)
-    emb = embeddings.numpy().mean(axis=0)
-    return emb.reshape(1, -1)
+
+    if INTERPRETER is not None:
+        input_details = INTERPRETER.get_input_details()
+        output_details = INTERPRETER.get_output_details()
+        INTERPRETER.resize_tensor_input(input_details[0]["index"], [len(wav)], strict=False)
+        INTERPRETER.allocate_tensors()
+        INTERPRETER.set_tensor(input_details[0]["index"], wav)
+        INTERPRETER.invoke()
+        # Output 0 is the [N, 1024] embeddings tensor
+        embeddings = INTERPRETER.get_tensor(output_details[0]["index"])
+        emb = embeddings.mean(axis=0)
+        return emb.reshape(1, -1)
+    elif YAMNET is not None:
+        _, embeddings, _ = YAMNET(wav)
+        emb = embeddings.numpy().mean(axis=0)
+        return emb.reshape(1, -1)
+    else:
+        raise RuntimeError("Embedding engine not ready.")
 
 
 def predict_audio_bytes(file_bytes: bytes):
     load_model_and_assets()
-    if YAMNET is None or WEIGHTS is None or SCALER is None:
-        raise RuntimeError("ML models are initializing. Please retry in a few seconds.")
+    if (INTERPRETER is None and YAMNET is None) or WEIGHTS is None or SCALER is None:
+        raise RuntimeError("ML engine is starting up. Please try again in a few seconds.")
 
     emb = extract_embedding_from_bytes(file_bytes)
     emb_scaled = SCALER.transform(emb)
 
-    # Ultra-fast pure NumPy forward pass for MLP head
+    # Ultra-fast pure NumPy forward pass (< 1 ms)
     h1 = np.maximum(0, np.dot(emb_scaled, WEIGHTS[0]) + WEIGHTS[1])
     h2 = np.maximum(0, np.dot(h1, WEIGHTS[2]) + WEIGHTS[3])
     logits = np.dot(h2, WEIGHTS[4]) + WEIGHTS[5]
@@ -365,7 +392,7 @@ HTML_UI = """
 
 <div class="container">
     <div class="header">
-        <span class="badge">AcousticSceneBD • YAMNet</span>
+        <span class="badge">AcousticSceneBD • YAMNet Lite</span>
         <h1>Acoustic Scene Classifier</h1>
         <p class="subtitle">Classify real-world environmental sounds (Bus, Metro, Park, Restaurant, Shopping Mall, University) with Deep Audio Embeddings.</p>
     </div>
@@ -384,7 +411,7 @@ HTML_UI = """
 
     <div class="loader" id="loader">
         <div class="spinner"></div>
-        <span>Extracting YAMNet features & analyzing audio...</span>
+        <span>Analyzing acoustic features...</span>
     </div>
 
     <div class="result-card" id="result-card">
@@ -470,7 +497,7 @@ HTML_UI = """
             try {
                 data = JSON.parse(text);
             } catch (e) {
-                throw new Error(text || 'Server returned an invalid response');
+                throw new Error('Service is busy or warming up. Please click Analyze again.');
             }
 
             if (!response.ok) {
@@ -499,7 +526,7 @@ HTML_UI = """
 
             resultCard.style.display = 'block';
         } catch (error) {
-            alert('Error: ' + error.message);
+            alert(error.message);
         } finally {
             loader.style.display = 'none';
             btnPredict.disabled = false;
