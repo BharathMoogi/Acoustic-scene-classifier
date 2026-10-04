@@ -9,16 +9,14 @@ import librosa
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import tensorflow_hub as hub
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sklearn.preprocessing import StandardScaler
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "outputs" / "model.keras"
+YAMNET_DIR = BASE_DIR / "outputs" / "yamnet_model"
+WEIGHTS_PATH = BASE_DIR / "outputs" / "model_weights.pkl"
 SCALER_PATH = BASE_DIR / "outputs" / "scaler.pkl"
-EMBEDDINGS_PATH = BASE_DIR / "embeddings.npz"
 
 CLASS_NAMES = [
     "Bus",
@@ -31,35 +29,38 @@ CLASS_NAMES = [
 ]
 YAMNET_SAMPLE_RATE = 16000
 
-MODEL = None
 YAMNET = None
+WEIGHTS = None
 SCALER = None
 
 
 def load_model_and_assets():
-    global MODEL, YAMNET, SCALER
+    global YAMNET, WEIGHTS, SCALER
     try:
-        if MODEL is None and MODEL_PATH.exists():
-            MODEL = tf.keras.models.load_model(str(MODEL_PATH))
         if YAMNET is None:
-            YAMNET = hub.load("https://tfhub.dev/google/yamnet/1")
-        if SCALER is None:
-            if SCALER_PATH.exists():
-                with open(SCALER_PATH, "rb") as f:
-                    SCALER = pickle.load(f)
-            elif EMBEDDINGS_PATH.exists():
-                data = np.load(EMBEDDINGS_PATH, allow_pickle=True)
-                scaler = StandardScaler()
-                scaler.fit(data["embeddings"])
-                SCALER = scaler
+            if YAMNET_DIR.exists():
+                YAMNET = tf.saved_model.load(str(YAMNET_DIR))
+            else:
+                import tensorflow_hub as hub
+                YAMNET = hub.load("https://tfhub.dev/google/yamnet/1")
+
+        if WEIGHTS is None and WEIGHTS_PATH.exists():
+            with open(WEIGHTS_PATH, "rb") as f:
+                WEIGHTS = pickle.load(f)
+
+        if SCALER is None and SCALER_PATH.exists():
+            with open(SCALER_PATH, "rb") as f:
+                SCALER = pickle.load(f)
+
+        print("All ML assets successfully loaded into memory.")
     except Exception as e:
-        print(f"Error loading models: {e}")
+        print(f"Error loading assets: {e}")
         traceback.print_exc()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Preload models at startup
+    # Preload models into RAM at startup
     load_model_and_assets()
     yield
 
@@ -99,12 +100,19 @@ def extract_embedding_from_bytes(file_bytes: bytes):
 
 def predict_audio_bytes(file_bytes: bytes):
     load_model_and_assets()
-    if MODEL is None or YAMNET is None or SCALER is None:
-        raise RuntimeError("ML model or assets are not initialized yet.")
+    if YAMNET is None or WEIGHTS is None or SCALER is None:
+        raise RuntimeError("ML models are initializing. Please retry in a few seconds.")
 
     emb = extract_embedding_from_bytes(file_bytes)
     emb_scaled = SCALER.transform(emb)
-    scores = MODEL.predict(emb_scaled, verbose=0)[0]
+
+    # Ultra-fast pure NumPy forward pass for MLP head
+    h1 = np.maximum(0, np.dot(emb_scaled, WEIGHTS[0]) + WEIGHTS[1])
+    h2 = np.maximum(0, np.dot(h1, WEIGHTS[2]) + WEIGHTS[3])
+    logits = np.dot(h2, WEIGHTS[4]) + WEIGHTS[5]
+    exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+    scores = (exp_logits / np.sum(exp_logits, axis=1, keepdims=True))[0]
+
     pred_idx = int(np.argmax(scores))
     pred_label = CLASS_NAMES[pred_idx]
     confidence = float(scores[pred_idx])
