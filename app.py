@@ -515,12 +515,12 @@ def health():
 
 
 @app.post("/predict")
-async def predict_audio(file: UploadFile = File(...)):
+def predict_audio(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith((".wav", ".mp3", ".flac")):
         raise HTTPException(status_code=400, detail="Please upload a .wav, .mp3, or .flac file.")
 
     try:
-        contents = await file.read()
+        contents = file.file.read()
         result = predict_audio_bytes(contents)
         return result
     except Exception as exc:
