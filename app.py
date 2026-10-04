@@ -1,17 +1,19 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 import io
+import math
 import pickle
+import threading
 import traceback
 
-import soundfile as sf
-import librosa
 import numpy as np
 import pandas as pd
+import scipy.signal as sps
+import soundfile as sf
 import tensorflow as tf
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 TFLITE_PATH = BASE_DIR / "outputs" / "yamnet_quant.tflite"
@@ -34,16 +36,22 @@ INTERPRETER = None
 YAMNET = None
 WEIGHTS = None
 SCALER = None
+MODEL_LOCK = threading.Lock()
+
+
+IS_INITIALIZED = False
 
 
 def load_model_and_assets():
-    global INTERPRETER, YAMNET, WEIGHTS, SCALER
+    global INTERPRETER, YAMNET, WEIGHTS, SCALER, IS_INITIALIZED
+    if IS_INITIALIZED:
+        return
     try:
         if INTERPRETER is None and TFLITE_PATH.exists():
             interp = tf.lite.Interpreter(model_path=str(TFLITE_PATH))
             interp.allocate_tensors()
             INTERPRETER = interp
-            print("Loaded ultra-lightweight YAMNet TFLite engine (< 4MB).")
+            print("Loaded ultra-lightweight YAMNet TFLite engine.")
         elif YAMNET is None:
             if YAMNET_DIR.exists():
                 YAMNET = tf.saved_model.load(str(YAMNET_DIR))
@@ -59,7 +67,14 @@ def load_model_and_assets():
             with open(SCALER_PATH, "rb") as f:
                 SCALER = pickle.load(f)
 
-        print("ML runtime ready.")
+        IS_INITIALIZED = True
+
+        # Full warm-up pass (audio decoding + TFLite + NumPy forward pass)
+        buf = io.BytesIO()
+        sf.write(buf, np.zeros(YAMNET_SAMPLE_RATE * 2, dtype=np.float32), YAMNET_SAMPLE_RATE, format="WAV")
+        _ = predict_audio_bytes(buf.getvalue())
+
+        print("ML runtime fully pre-warmed and ready for instant inference.")
     except Exception as e:
         print(f"Error loading assets: {e}")
         traceback.print_exc()
@@ -81,23 +96,27 @@ app.add_middleware(
 )
 
 
-def safe_load_audio(file_bytes: bytes, target_sr=16000, max_seconds=15) -> np.ndarray:
+def safe_load_audio(file_bytes: bytes, target_sr=16000, max_seconds=10) -> np.ndarray:
     try:
         data, sr = sf.read(io.BytesIO(file_bytes))
-    except Exception:
-        data, sr = librosa.load(io.BytesIO(file_bytes), sr=target_sr, mono=True)
-        data = data.astype("float32")
-        return data[: target_sr * max_seconds]
+    except Exception as exc:
+        raise ValueError(f"Could not decode audio file: {exc}")
 
     if data.ndim > 1:
         data = data.mean(axis=1)
+
+    data = data.astype(np.float32)
+
     if sr != target_sr:
-        data = librosa.resample(data.astype("float32"), orig_sr=sr, target_sr=target_sr)
-    
-    # Cap to max_seconds for instant responsive inference
-    data = data.astype("float32")
-    if len(data) > target_sr * max_seconds:
-        data = data[: target_sr * max_seconds]
+        gcd = math.gcd(sr, target_sr)
+        up = target_sr // gcd
+        down = sr // gcd
+        data = sps.resample_poly(data, up, down).astype(np.float32)
+
+    max_samples = target_sr * max_seconds
+    if len(data) > max_samples:
+        data = data[:max_samples]
+
     return data
 
 
@@ -107,28 +126,28 @@ def extract_embedding_from_bytes(file_bytes: bytes):
         raise ValueError("Audio file is empty.")
 
     if INTERPRETER is not None:
-        input_details = INTERPRETER.get_input_details()
-        output_details = INTERPRETER.get_output_details()
-        INTERPRETER.resize_tensor_input(input_details[0]["index"], [len(wav)], strict=False)
-        INTERPRETER.allocate_tensors()
-        INTERPRETER.set_tensor(input_details[0]["index"], wav)
-        INTERPRETER.invoke()
-        # Output 0 is the [N, 1024] embeddings tensor
-        embeddings = INTERPRETER.get_tensor(output_details[0]["index"])
-        emb = embeddings.mean(axis=0)
-        return emb.reshape(1, -1)
+        with MODEL_LOCK:
+            input_details = INTERPRETER.get_input_details()
+            output_details = INTERPRETER.get_output_details()
+            INTERPRETER.resize_tensor_input(input_details[0]["index"], [len(wav)], strict=False)
+            INTERPRETER.allocate_tensors()
+            INTERPRETER.set_tensor(input_details[0]["index"], wav)
+            INTERPRETER.invoke()
+            embeddings = INTERPRETER.get_tensor(output_details[0]["index"])
+            emb = embeddings.mean(axis=0)
+            return emb.reshape(1, -1)
     elif YAMNET is not None:
         _, embeddings, _ = YAMNET(wav)
         emb = embeddings.numpy().mean(axis=0)
         return emb.reshape(1, -1)
     else:
-        raise RuntimeError("Embedding engine not ready.")
+        raise RuntimeError("Embedding engine not initialized.")
 
 
 def predict_audio_bytes(file_bytes: bytes):
     load_model_and_assets()
     if (INTERPRETER is None and YAMNET is None) or WEIGHTS is None or SCALER is None:
-        raise RuntimeError("ML engine is starting up. Please try again in a few seconds.")
+        raise RuntimeError("Server is starting up. Please try again.")
 
     emb = extract_embedding_from_bytes(file_bytes)
     emb_scaled = SCALER.transform(emb)
@@ -382,6 +401,18 @@ HTML_UI = """
             margin: 0 auto 10px;
         }
 
+        .error-banner {
+            display: none;
+            margin-top: 15px;
+            padding: 12px 16px;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 10px;
+            color: #fca5a5;
+            font-size: 14px;
+            text-align: center;
+        }
+
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
@@ -400,14 +431,16 @@ HTML_UI = """
     <div class="drop-zone" id="drop-zone">
         <span class="upload-icon">🎧</span>
         <div style="font-weight:600; font-size:15px; margin-bottom: 4px;">Click to select or drag & drop audio</div>
-        <div style="font-size:12px; color:var(--text-muted);">Supported formats: .WAV, .MP3, .FLAC</div>
+        <div style="font-size:12px; color:var(--text-muted);">Supported formats: .WAV, .MP3, .FLAC, .OGG</div>
         <div class="file-info" id="file-info"></div>
     </div>
-    <input type="file" id="file-input" accept=".wav,.mp3,.flac">
+    <input type="file" id="file-input" accept=".wav,.mp3,.flac,.ogg">
 
     <audio id="audio-preview" controls></audio>
 
     <button class="btn-predict" id="btn-predict" disabled style="margin-top: 15px;">Analyze Acoustic Scene</button>
+
+    <div class="error-banner" id="error-banner"></div>
 
     <div class="loader" id="loader">
         <div class="spinner"></div>
@@ -439,6 +472,7 @@ HTML_UI = """
     const predClass = document.getElementById('pred-class');
     const predConf = document.getElementById('pred-conf');
     const probList = document.getElementById('prob-list');
+    const errorBanner = document.getElementById('error-banner');
 
     let selectedFile = null;
 
@@ -470,6 +504,7 @@ HTML_UI = """
         fileInfo.textContent = `Selected: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
         btnPredict.disabled = false;
         resultCard.style.display = 'none';
+        errorBanner.style.display = 'none';
 
         const url = URL.createObjectURL(file);
         audioPreview.src = url;
@@ -482,6 +517,7 @@ HTML_UI = """
         btnPredict.disabled = true;
         loader.style.display = 'block';
         resultCard.style.display = 'none';
+        errorBanner.style.display = 'none';
 
         const formData = new FormData();
         formData.append('file', selectedFile);
@@ -497,7 +533,7 @@ HTML_UI = """
             try {
                 data = JSON.parse(text);
             } catch (e) {
-                throw new Error('Service is busy or warming up. Please click Analyze again.');
+                throw new Error('Server returned unexpected format. Please try again.');
             }
 
             if (!response.ok) {
@@ -526,7 +562,8 @@ HTML_UI = """
 
             resultCard.style.display = 'block';
         } catch (error) {
-            alert(error.message);
+            errorBanner.textContent = error.message;
+            errorBanner.style.display = 'block';
         } finally {
             loader.style.display = 'none';
             btnPredict.disabled = false;
@@ -551,8 +588,8 @@ def health():
 
 @app.post("/predict")
 def predict_audio(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith((".wav", ".mp3", ".flac")):
-        raise HTTPException(status_code=400, detail="Please upload a .wav, .mp3, or .flac file.")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded.")
 
     try:
         contents = file.file.read()
