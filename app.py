@@ -1,5 +1,7 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 import io
+import pickle
 
 import librosa
 import numpy as np
@@ -8,11 +10,14 @@ import tensorflow as tf
 import tensorflow_hub as hub
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import StandardScaler
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "outputs" / "model.keras"
+SCALER_PATH = BASE_DIR / "outputs" / "scaler.pkl"
 EMBEDDINGS_PATH = BASE_DIR / "embeddings.npz"
+
 CLASS_NAMES = [
     "Bus",
     "Metro",
@@ -23,8 +28,6 @@ CLASS_NAMES = [
     "University",
 ]
 YAMNET_SAMPLE_RATE = 16000
-
-app = FastAPI(title="Acoustic Scene Classifier")
 
 MODEL = None
 YAMNET = None
@@ -38,10 +41,31 @@ def load_model_and_assets():
     if YAMNET is None:
         YAMNET = hub.load("https://tfhub.dev/google/yamnet/1")
     if SCALER is None:
-        data = np.load(EMBEDDINGS_PATH, allow_pickle=True)
-        scaler = StandardScaler()
-        scaler.fit(data["embeddings"])
-        SCALER = scaler
+        if SCALER_PATH.exists():
+            with open(SCALER_PATH, "rb") as f:
+                SCALER = pickle.load(f)
+        elif EMBEDDINGS_PATH.exists():
+            data = np.load(EMBEDDINGS_PATH, allow_pickle=True)
+            scaler = StandardScaler()
+            scaler.fit(data["embeddings"])
+            SCALER = scaler
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Preload models into memory at container startup so requests don't time out
+    load_model_and_assets()
+    yield
+
+app = FastAPI(title="Acoustic Scene Classifier", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def extract_embedding_from_bytes(file_bytes: bytes):
@@ -411,12 +435,17 @@ HTML_UI = """
                 body: formData
             });
 
-            if (!response.ok) {
-                const err = await response.json();
-                throw new Error(err.detail || 'Prediction failed');
+            const text = await response.text();
+            let data;
+            try {
+                data = JSON.parse(text);
+            } catch (e) {
+                throw new Error(text || 'Server returned an invalid response');
             }
 
-            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.detail || 'Prediction failed');
+            }
 
             predClass.textContent = data.label;
             predConf.textContent = (data.confidence * 100).toFixed(1) + '%';
